@@ -1,0 +1,972 @@
+---
+title: Homework 2
+jupyter: econ470-a0kernel
+---
+
+```{python}
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+!pip install statsmodels
+import statsmodels.api as sm
+!pip install scikit-learn
+from sklearn.neighbors import NearestNeighbors
+from sklearn.linear_model import LogisticRegression
+```
+
+```{python}
+data = pd.read_csv("../data/output/master_data.csv")
+df = pd.read_csv("../data/output/master_data.csv")
+```
+
+```{python}
+print (df.head())
+```
+
+```{python}
+summary_df = data.describe()
+print(summary_df)
+```
+
+```{python}
+columns_df = pd.DataFrame(data.columns, columns=['column_name'])
+print(columns_df)
+```
+
+```{python}
+#| scrolled: true
+# Question 1
+data["planid_num"] = pd.to_numeric(data["planid"], errors="coerce")
+data["year"] = pd.to_numeric(data["year"], errors="coerce")
+
+# Make numeric copies
+data["planid_num"] = pd.to_numeric(data["planid"], errors="coerce")
+data["year"] = pd.to_numeric(data["year"], errors="coerce")
+data["fips"] = pd.to_numeric(data["fips"], errors="coerce")
+
+# Apply assignment filters
+
+# Remove SNPs
+data = data[data["snp"] != "Yes"]
+
+# Remove 800–899 plans only
+data = data[~data["planid_num"].between(800, 899, inclusive="both")]
+
+# Remove prescription-drug-only plans (PDP-only)
+data= data[data['partd'] == 'Yes']
+
+# Keep valid counties and years
+data = data[data["fips"].notna()]
+data = data[data["year"].between(2014, 2019)]
+
+# Drop missing plan IDs
+data = data[data["planid_num"].notna()].copy()
+
+# Count unique plans per county-year
+plan_pairs = (
+    data[["year", "fips", "contractid"]]
+    .drop_duplicates()
+)
+
+plan_counts = (
+    plan_pairs.groupby(["year", "fips"])
+    .size()
+    .reset_index(name="n_plans")
+)
+
+# Boxplot by year
+years = sorted(plan_counts["year"].unique())
+data_by_year = [plan_counts.loc[plan_counts["year"] == y, "n_plans"].values for y in years]
+
+plt.figure()
+plt.boxplot(data_by_year, labels=[str(int(y)) for y in years])
+plt.xlabel("Year")
+plt.ylabel("Number of plans per county")
+plt.title("Distribution of MA plan counts by county (2014–2019)")
+plt.tight_layout()
+plt.show()
+
+# Summary stats
+summary = (
+    plan_counts.groupby("year")["n_plans"]
+    .agg(["count", "median", "mean", "min", "max"])
+    .reset_index()
+)
+
+print(summary)
+```
+
+# Between 2014 and 2016, the number of plans was too few. Between 2017 and 2019, the number of plans was much higher, in my opinion at a 
+# sufficient value. Overall, the graph shows expanding plan availability over time. 
+
+
+```{python}
+# Question 2
+
+for c in ["rebate_partc", "premium", "premium_partc", "payment_partc", "riskscore_partc", "bid"]:
+    if c in data.columns:
+        data[c] = pd.to_numeric(data[c], errors="coerce")
+
+# compute basic premium + bid 
+data["basic_premium_recalc"] = np.where(
+    data["rebate_partc"] > 0,
+    0,
+    np.where(
+        (data["partd"] == "No") & data["premium"].notna() & data["premium_partc"].isna(),
+        data["premium"],
+        data["premium_partc"]
+    )
+)
+
+# bid:
+data["bid_recalc"] = np.nan
+valid_risk = data["riskscore_partc"].notna() & (data["riskscore_partc"] != 0)
+
+mask1 = valid_risk & (data["rebate_partc"] == 0) & (data["basic_premium_recalc"] > 0)
+data.loc[mask1, "bid_recalc"] = (
+    (data.loc[mask1, "payment_partc"] + data.loc[mask1, "basic_premium_recalc"])
+    / data.loc[mask1, "riskscore_partc"]
+)
+
+mask2 = valid_risk & ((data["rebate_partc"] > 0) | (data["basic_premium_recalc"] == 0))
+data.loc[mask2, "bid_recalc"] = (
+    data.loc[mask2, "payment_partc"] / data.loc[mask2, "riskscore_partc"]
+)
+
+# Frequency histograms
+def plot_bid_hist(df, year, bid_col="bid_recalc", bins=50):
+    x = df.loc[df["year"] == year, bid_col].dropna()
+    plt.figure()
+    plt.hist(x, bins=bins)
+    plt.title(f"Distribution of plan bids ({year})")
+    plt.xlabel("Bid")
+    plt.ylabel("Count of Plans")
+    plt.tight_layout()
+    plt.show()
+
+plot_bid_hist(data, 2014, bid_col="bid_recalc", bins=50)
+plot_bid_hist(data, 2018, bid_col="bid_recalc", bins=50)
+
+#summary stats
+def bid_summary(df, year, bid_col="bid_recalc"):
+    x = df.loc[df["year"] == year, bid_col].dropna()
+    return pd.Series({
+        "n": x.shape[0],
+        "mean": x.mean(),
+        "median": x.median(),
+        "p10": x.quantile(0.10),
+        "p90": x.quantile(0.90),
+        "min": x.min(),
+        "max": x.max(),
+    })
+
+bid_stats = pd.DataFrame(
+    [bid_summary(data, 2014), bid_summary(data, 2018)],
+    index=[2014, 2018]
+)
+print(bid_stats)
+```
+
+# How has distribution changed over time
+# The distribution of these plan bids shifted downward on average, while the overall number of plans increased.
+
+```{python}
+# Question 3
+
+data["avg_enrollment"] = pd.to_numeric(data["avg_enrollment"], errors="coerce")
+data["avg_enrollment"].notna()
+
+# Compute contract-level enrollment per county-year
+contractenrollment = (
+    data.groupby(["year", "fips", "contractid"])["avg_enrollment"]
+    .sum()
+    .reset_index(name="contract_enroll")
+)
+
+# Compute total county enrollment
+countyenroll = (
+    contractenrollment.groupby(["year", "fips"])["contract_enroll"]
+    .sum()
+    .reset_index(name="county_total")
+)
+
+contractenrollment = contractenrollment.merge(
+    countyenroll,
+    on=["year", "fips"],
+    how="left"
+)
+
+# Compute market shares and HHI
+contractenrollment["share"] = (
+    contractenrollment["contract_enroll"]
+    / contractenrollment["county_total"]
+)
+
+contractenrollment["share_sq"] = contractenrollment["share"] ** 2
+county_hhi = (
+    contractenrollment.groupby(["year", "fips"])["share_sq"]
+    .sum()
+    .reset_index(name="hhi")
+)
+
+# Average HHI by year
+avg_hhi = (
+    county_hhi.groupby("year")["hhi"]
+     .mean()
+    .reset_index(name="avg_hhi")
+)
+
+print(avg_hhi)
+plt.figure()
+plt.plot(avg_hhi["year"], avg_hhi["avg_hhi"], marker="o")
+plt.title("Average HHI over Time")
+plt.tight_layout()
+plt.show()
+```
+
+# How has the HHI changed over time 
+# Based on the illustration of the graph, we can conclude that HHI has decreased over time. It was at its highest in 2014 and then had a stark drop in 2015, continuing a small downward trend until slightly rising in 2017, and then a stark drop in the years following.
+
+```{python}
+print(data.groupby("year")[["avg_enrolled", "avg_eligibles"]].count())
+```
+
+```{python}
+print(data.columns)
+```
+
+```{python}
+print(data["year_pen"].value_counts(dropna=False).sort_index())
+```
+
+```{python}
+print(data.loc[data["year"].between(2014, 2016), 
+               ["year", "year_pen", "avg_enrolled", "avg_eligibles"]].head(10))
+```
+
+```{python}
+import os
+print(os.listdir())
+```
+
+```{python}
+print("Years in plan data:", sorted(data["year"].dropna().unique()))
+print("Years in penetration data:", sorted(data["year_pen"].dropna().unique()))
+```
+
+```{python}
+print(data.groupby("year_pen")[["avg_enrolled", "avg_eligibles"]].count())
+```
+
+```{python}
+# Question 4 
+pen = data.loc[
+    data["year"].between(2014, 2019)
+    & data["fips"].notna()
+    & data["avg_enrolled"].notna()
+    & data["avg_eligibles"].notna()
+    & (data["avg_eligibles"] > 0),
+    ["year", "fips", "avg_enrolled", "avg_eligibles"]
+].copy()
+
+
+pen_county = (
+    pen.groupby(["year", "fips"], as_index=False)
+       .agg({
+           "avg_enrolled": "first",
+           "avg_eligibles": "first"
+       })
+)
+
+# Compute MA share
+pen_county["ma_share"] = (
+    pen_county["avg_enrolled"] / pen_county["avg_eligibles"]
+)
+
+# Average across counties
+ma_share_year = (
+    pen_county.groupby("year", as_index=False)["ma_share"]
+    .mean()
+    .rename(columns={"ma_share": "avg_ma_share"})
+)
+
+print(ma_share_year)
+
+# Plot
+plt.figure()
+plt.plot(ma_share_year["year"], ma_share_year["avg_ma_share"], marker="o")
+plt.xlabel("Year")
+plt.ylabel("Average MA share")
+plt.title("Average Medicare Advantage penetration (2014–2019)")
+plt.tight_layout()
+plt.show()
+```
+
+# Has Medicare Advantage increased or decreased?
+# Medicare Advantage has increased and become more popular over time. 
+
+```{python}
+# Question 5
+# 1. Keep only 2018 data
+data_2018 = data[data["year"] == 2018].copy()
+
+# Ensure numeric types
+data_2018["bid"] = pd.to_numeric(data_2018["bid"], errors="coerce")
+data_2018["avg_enrollment"] = pd.to_numeric(data_2018["avg_enrollment"], errors="coerce")
+
+# Drop rows with missing values
+data_2018 = data_2018.dropna(subset=["bid", "avg_enrollment", "fips"])
+
+# 2. Compute plan market shares within county
+data_2018["county_total_enrollment"] = (
+    data_2018.groupby("fips")["avg_enrollment"].transform("sum")
+)
+
+data_2018["market_share"] = (
+    data_2018["avg_enrollment"] / data_2018["county_total_enrollment"]
+)
+
+# 3. Compute HHI per county
+hhi_2018 = (
+    data_2018.groupby("fips")["market_share"]
+    .apply(lambda x: (x**2).sum())
+    .reset_index(name="hhi")
+)
+
+# 4. Determine percentile cutoffs
+p33 = hhi_2018["hhi"].quantile(0.33)
+p66 = hhi_2018["hhi"].quantile(0.66)
+
+print("33rd percentile HHI:", p33)
+print("66th percentile HHI:", p66)
+# 5. Classify markets
+def classify_market(hhi):
+    if hhi <= p33:
+        return "competitive"
+    elif hhi >= p66:
+        return "uncompetitive"
+    else:
+        return "middle"
+
+hhi_2018["market_type"] = hhi_2018["hhi"].apply(classify_market)
+
+# 6. Merge classification back to plan data
+data_2018 = data_2018.merge(hhi_2018, on="fips", how="left")
+
+# 7. Compare average bids
+avg_bid = (
+    data_2018[data_2018["market_type"].isin(["competitive", "uncompetitive"])]
+    .groupby("market_type")["bid"]
+    .mean()
+    .reset_index()
+)
+
+from IPython.display import display
+
+display(avg_bid)
+```
+
+```{python}
+print(df.columns)
+```
+
+```{python}
+# Question 6
+
+# Filter to 2018
+df_2018 = data.copy()
+df_2018["year"] = pd.to_numeric(df_2018["year"], errors="coerce")
+df_2018 = df_2018[df_2018["year"] == 2018].copy()
+
+# Make sure numeric
+df_2018["bid"] = pd.to_numeric(df_2018["bid"], errors="coerce")
+df_2018["avg_enrolled"] = pd.to_numeric(df_2018["avg_enrolled"], errors="coerce")
+df_2018["payment_partc"] = pd.to_numeric(df_2018["payment_partc"], errors="coerce")
+
+# Drop missing values
+df_2018 = df_2018[df_2018["bid"].notna() & df_2018["avg_enrolled"].notna() & df_2018["payment_partc"].notna()].copy()
+
+# --- Compute HHI for each county ---
+# Define firm
+df_2018["firm"] = df_2018["parent_org"].fillna(df_2018["org_name"]).astype(str)
+
+# Market totals
+market_total = df_2018.groupby("fips")["avg_enrolled"].sum().rename("mkt_enroll").reset_index()
+firm_total = df_2018.groupby(["fips", "firm"])["avg_enrolled"].sum().rename("firm_enroll").reset_index()
+firm_total = firm_total.merge(market_total, on="fips", how="left")
+firm_total["share"] = firm_total["firm_enroll"] / firm_total["mkt_enroll"]
+
+# HHI per market
+hhi_market = firm_total.groupby("fips")["share"].apply(lambda x: (x**2).sum()).reset_index(name="hhi")
+
+# Define competitive/uncompetitive
+p33 = hhi_market["hhi"].quantile(1/3)
+p66 = hhi_market["hhi"].quantile(2/3)
+hhi_market["treated"] = np.where(hhi_market["hhi"] >= p66, 1,
+                                 np.where(hhi_market["hhi"] <= p33, 0, np.nan))
+# Keep only competitive/uncompetitive
+hhi_market = hhi_market[hhi_market["treated"].notna()].copy()
+hhi_market["treated"] = hhi_market["treated"].astype(int)
+
+# Merge back to df_2018
+df_2018 = df_2018.merge(hhi_market[["fips","hhi","treated"]], on="fips", how="inner")
+
+# --- FFS quartiles ---
+df_2018["ffs_q"] = pd.qcut(df_2018["payment_partc"], 4, labels=[1, 2, 3, 4])
+for q in [1,2,3,4]:
+    df_2018[f"ffs_q{q}"] = (df_2018["ffs_q"].astype(int) == q).astype(int)
+
+# --- Average bid table ---
+table = (
+    df_2018.groupby(["ffs_q", "treated"])["bid"]
+           .mean()
+           .reset_index()
+           .pivot(index="ffs_q", columns="treated", values="bid")
+           .rename(columns={0: "avg_bid_competitive", 1: "avg_bid_uncompetitive"})
+           .reset_index()
+)
+
+# Add counts
+counts = (
+    df_2018.groupby(["ffs_q", "treated"])["bid"]
+           .size()
+           .reset_index(name="n_obs")
+           .pivot(index="ffs_q", columns="treated", values="n_obs")
+           .rename(columns={0: "n_competitive", 1: "n_uncompetitive"})
+           .reset_index()
+)
+
+# Merge final table
+out_2018 = table.merge(counts, on="ffs_q", how="left").sort_values("ffs_q")
+out_2018[["avg_bid_competitive","avg_bid_uncompetitive"]] = out_2018[["avg_bid_competitive","avg_bid_uncompetitive"]].round(2)
+
+# Display
+print(f"HHI cutoffs for 2018: 33rd pct = {p33:.4f}, 66th pct = {p66:.4f}\n")
+display(out_2018)# Filter to 2018
+df_2018 = data.copy()
+df_2018["year"] = pd.to_numeric(df_2018["year"], errors="coerce")
+df_2018 = df_2018[df_2018["year"] == 2018].copy()
+
+# Make sure numeric
+df_2018["bid"] = pd.to_numeric(df_2018["bid"], errors="coerce")
+df_2018["avg_enrolled"] = pd.to_numeric(df_2018["avg_enrolled"], errors="coerce")
+df_2018["payment_partc"] = pd.to_numeric(df_2018["payment_partc"], errors="coerce")
+
+# Drop missing values
+df_2018 = df_2018[df_2018["bid"].notna() & df_2018["avg_enrolled"].notna() & df_2018["payment_partc"].notna()].copy()
+
+# --- Compute HHI for each county ---
+# Define firm
+df_2018["firm"] = df_2018["parent_org"].fillna(df_2018["org_name"]).astype(str)
+
+# Market totals
+market_total = df_2018.groupby("fips")["avg_enrolled"].sum().rename("mkt_enroll").reset_index()
+firm_total = df_2018.groupby(["fips", "firm"])["avg_enrolled"].sum().rename("firm_enroll").reset_index()
+firm_total = firm_total.merge(market_total, on="fips", how="left")
+firm_total["share"] = firm_total["firm_enroll"] / firm_total["mkt_enroll"]
+
+# HHI per market
+hhi_market = firm_total.groupby("fips")["share"].apply(lambda x: (x**2).sum()).reset_index(name="hhi")
+
+# Define competitive/uncompetitive
+p33 = hhi_market["hhi"].quantile(1/3)
+p66 = hhi_market["hhi"].quantile(2/3)
+hhi_market["treated"] = np.where(hhi_market["hhi"] >= p66, 1,
+                                 np.where(hhi_market["hhi"] <= p33, 0, np.nan))
+# Keep only competitive/uncompetitive
+hhi_market = hhi_market[hhi_market["treated"].notna()].copy()
+hhi_market["treated"] = hhi_market["treated"].astype(int)
+
+# Merge back to df_2018
+df_2018 = df_2018.merge(hhi_market[["fips","hhi","treated"]], on="fips", how="inner")
+
+# --- FFS quartiles ---
+df_2018["ffs_q"] = pd.qcut(df_2018["payment_partc"], 4, labels=[1, 2, 3, 4])
+for q in [1,2,3,4]:
+    df_2018[f"ffs_q{q}"] = (df_2018["ffs_q"].astype(int) == q).astype(int)
+
+# --- Average bid table ---
+table = (
+    df_2018.groupby(["ffs_q", "treated"])["bid"]
+           .mean()
+           .reset_index()
+           .pivot(index="ffs_q", columns="treated", values="bid")
+           .rename(columns={0: "avg_bid_competitive", 1: "avg_bid_uncompetitive"})
+           .reset_index()
+)
+
+# Add counts
+counts = (
+    df_2018.groupby(["ffs_q", "treated"])["bid"]
+           .size()
+           .reset_index(name="n_obs")
+           .pivot(index="ffs_q", columns="treated", values="n_obs")
+           .rename(columns={0: "n_competitive", 1: "n_uncompetitive"})
+           .reset_index()
+)
+
+# Merge final table
+out_2018 = table.merge(counts, on="ffs_q", how="left").sort_values("ffs_q")
+out_2018[["avg_bid_competitive","avg_bid_uncompetitive"]] = out_2018[["avg_bid_competitive","avg_bid_uncompetitive"]].round(2)
+
+# Display
+print(f"HHI cutoffs for 2018: 33rd pct = {p33:.4f}, 66th pct = {p66:.4f}\n")
+display(out_2018)
+
+# Display nicely
+from IPython.display import display
+display()
+```
+
+```{python}
+# Compute total enrollment per firm in each market
+df["firm"] = df["parent_org"].fillna(df["org_name"]).astype(str)
+firm_total = (
+    df.groupby(["fips", "year", "firm"])["avg_enrolled"].sum()
+      .rename("firm_enroll")
+      .reset_index()
+)
+market_total = firm_total.groupby(["fips", "year"])["firm_enroll"].sum().rename("mkt_enroll").reset_index()
+firm_total = firm_total.merge(market_total, on=["fips", "year"])
+firm_total["share"] = firm_total["firm_enroll"] / firm_total["mkt_enroll"]
+
+# HHI per market
+hhi_market = (
+    firm_total.assign(share_sq=lambda x: x["share"] ** 2)
+             .groupby(["fips", "year"])["share_sq"]
+             .sum()
+             .rename("hhi")
+             .reset_index()
+)
+
+# Define treated vs control
+p33 = hhi_market["hhi"].quantile(1/3)
+p66 = hhi_market["hhi"].quantile(2/3)
+hhi_market["treated"] = np.where(hhi_market["hhi"] >= p66, 1,
+                                 np.where(hhi_market["hhi"] <= p33, 0, np.nan))
+
+# Keep only competitive/uncompetitive markets
+hhi_market = hhi_market[hhi_market["treated"].notna()].copy()
+hhi_market["treated"] = hhi_market["treated"].astype(int)
+
+# Merge back to df
+df = df.merge(hhi_market[["fips", "year", "treated"]], on=["fips", "year"], how="inner")
+```
+
+```{python}
+# Check that the treated column exists
+print(df.columns)
+```
+
+```{python}
+df2018 = df[df["year"] == 2018].copy()
+```
+
+```{python}
+df2018 = df2018.merge(
+    hhi_market[["fips", "hhi", "treated"]],
+    on="fips",
+    how="inner"
+)
+```
+
+```{python}
+print("After merge columns:", df2018.columns.tolist())
+print("Does treated exist?", "treated" in df2018.columns)
+print("Shape:", df2018.shape)
+```
+
+```{python}
+df2018 = df2018.drop(columns=[c for c in df2018.columns if "treated" in c or "hhi" in c],
+                     errors="ignore")
+```
+
+```{python}
+df2018 = df2018.merge(
+    hhi_market[["fips", "hhi", "treated"]],
+    on="fips",
+    how="inner"
+)
+```
+
+```{python}
+print([c for c in df2018.columns if "treated" in c])
+print([c for c in df2018.columns if "hhi" in c])
+```
+
+```{python}
+print(df2018.columns)
+```
+
+```{python}
+print(df2018[['fips','year','hhi','treated']].head())
+print(df2018['treated'].value_counts())
+```
+
+```{python}
+# Create avg_ffscost using basic_premium if avg_ffscost doesn't exist
+df2018["avg_ffscost"] = pd.to_numeric(
+    df2018.get("avg_ffscost", df2018.get("basic_premium")), errors="coerce"
+)
+
+# Drop missing or zero costs
+df2018 = df2018[df2018["avg_ffscost"].notna() & (df2018["avg_ffscost"] > 0)].copy()
+
+# Now create quartiles safely, allowing duplicates
+df2018["ffs_q"] = pd.qcut(df2018["avg_ffscost"], 4, labels=[1,2,3,4], duplicates='drop')
+
+# Quick check
+print(df2018[["fips","year","avg_ffscost","ffs_q"]].head())
+```
+
+```{python}
+# --- Keep only 2018 ---
+df2018 = df[df["year"] == 2018].copy()
+
+# --- Ensure numeric ---
+df2018["avg_enrolled"] = pd.to_numeric(df2018["avg_enrolled"], errors="coerce")
+df2018 = df2018[df2018["avg_enrolled"].notna()].copy()
+
+# --- Identify firm ---
+df2018["firm"] = df2018["parent_org"].fillna(df2018["org_name"]).astype(str)
+
+# --- Compute market total enrollment by county ---
+market_total = df2018.groupby("fips")["avg_enrolled"].sum().rename("mkt_enroll").reset_index()
+
+# --- Compute firm enrollment share ---
+firm_total = (
+    df2018.groupby(["fips", "firm"])["avg_enrolled"].sum()
+    .rename("firm_enroll")
+    .reset_index()
+    .merge(market_total, on="fips")
+)
+firm_total["share"] = firm_total["firm_enroll"] / firm_total["mkt_enroll"]
+
+# --- Compute HHI per market ---
+hhi_market = (
+    firm_total.groupby("fips")["share"]
+    .apply(lambda x: (x**2).sum())
+    .reset_index(name="hhi")
+)
+
+# --- Assign treated (high HHI = uncompetitive) ---
+p33 = hhi_market["hhi"].quantile(1/3)
+p66 = hhi_market["hhi"].quantile(2/3)
+hhi_market["treated"] = np.where(
+    hhi_market["hhi"] >= p66, 1,
+    np.where(hhi_market["hhi"] <= p33, 0, np.nan)
+)
+
+# Drop old columns in df2018 to prevent duplicates 
+df2018 = df2018.drop(columns=[c for c in df2018.columns if c in ["hhi","treated"]], errors="ignore")
+
+# Merge HHI and treated into df2018
+df2018 = df2018.merge(
+    hhi_market[["fips","hhi","treated"]],
+    on="fips",
+    how="left"
+)
+
+# Drop middle tercile markets (where treated is NaN)
+df2018 = df2018[df2018["treated"].notna()].copy()
+
+# Now treated is only 0 or 1
+df2018["treated"] = df2018["treated"].astype(int)
+
+print(df2018["treated"].value_counts())
+
+# Compute avg_ffscost using basic_premium
+df2018["avg_ffscost"] = pd.to_numeric(
+    df2018.get("avg_ffscost", df2018.get("basic_premium")), errors="coerce"
+)
+df2018 = df2018[df2018["avg_ffscost"].notna() & (df2018["avg_ffscost"] > 0)].copy()
+
+# Create quartiles
+df2018["ffs_q"] = pd.qcut(df2018["avg_ffscost"], 4, labels=[1,2,3,4], duplicates='drop')
+
+# Quick check
+print(df2018[["fips","year","hhi","treated","avg_ffscost","ffs_q"]].head())
+print(df2018["treated"].value_counts())
+```
+
+```{python}
+df2018["bid"].describe()
+```
+
+```{python}
+Y = "bid"
+T = "treated"
+Q = "ffs_q"
+
+# Keep only the columns needed for Q7
+df2018_q7 = df2018[[Y, T, Q]].dropna().copy()
+```
+
+```{python}
+df2018_q7 = df2018_q7[df2018_q7[T].isin([0, 1])].copy()
+df2018_q7[T] = df2018_q7[T].astype(int)
+df2018_q7[Q] = df2018_q7[Q].astype(int)
+```
+
+```{python}
+print(df2018_q7[T].value_counts())
+```
+
+```{python}
+df2018_q7_clean = df2018[df2018["treated"].isin([0,1])].copy()
+
+df2018_q7_clean.groupby(["ffs_q", "treated"])["bid"].mean().unstack()
+```
+
+```{python}
+df2018[T] = df2018[T].astype(int)
+print(df2018_q7[T].value_counts())
+```
+
+```{python}
+# Keep only treated = 0 or 1 (remove middle tercile)
+df2018_q7 = df2018[[Y, T, Q]].dropna().copy()
+df2018_q7 = df2018_q7[df2018_q7[T].isin([0,1])].copy()
+
+# Check counts to confirm
+print(df2018_q7[T].value_counts())
+```
+
+```{python}
+df2018.groupby("treated")["hhi"].mean()
+df2018.groupby("treated")["bid"].mean()
+```
+
+```{python}
+Y = "bid"
+T = "treated"
+Q = "ffs_q"
+
+# Group by quartile
+g = df2018_q7.groupby(Q)
+
+# Quartile weights
+p_q = g.size() / len(df2018_q7)
+
+# Mean outcomes by treatment within quartile
+mu1_q = g.apply(lambda x: x.loc[x[T]==1, Y].mean())
+mu0_q = g.apply(lambda x: x.loc[x[T]==0, Y].mean())
+
+# Build stratification table
+strat_table = pd.DataFrame({
+    "p_q": p_q,
+    "mu1_q": mu1_q,
+    "mu0_q": mu0_q
+})
+
+# Difference (treated - control)
+strat_table["diff"] = strat_table["mu1_q"] - strat_table["mu0_q"]
+```
+
+```{python}
+strat_table[["p_q","mu1_q","mu0_q","diff"]]
+(sum(strat_table["p_q"] * strat_table["diff"]))
+```
+
+```{python}
+df2018.groupby("treated")["hhi"].describe()
+df2018.groupby(["ffs_q", "treated"])["bid"].mean().unstack()
+```
+
+```{python}
+print(df2018.columns.tolist())
+```
+
+```{python}
+# Drop old HHI/treated columns if they exist
+df2018 = df2018.drop(columns=[c for c in df2018.columns if "hhi" in c or "treated" in c], errors='ignore')
+
+# Merge fresh HHI and treated
+df2018 = df2018.merge(hhi_market[["fips", "hhi", "treated"]], on="fips", how="inner")
+
+# Sanity check
+print(df2018[["fips", "hhi", "treated"]].drop_duplicates().sort_values("hhi").head(10))
+print(df2018["treated"].value_counts())
+```
+
+```{python}
+print(df2018.columns.tolist())
+```
+
+```{python}
+# Ensure avg_ffscost exists and numeric
+df2018['avg_ffscost'] = pd.to_numeric(
+    df2018.get('avg_ffscost', df2018.get('basic_premium')),
+    errors='coerce'
+)
+
+# Keep only positive, non-missing costs
+df2018 = df2018[df2018['avg_ffscost'].notna() & (df2018['avg_ffscost'] > 0)].copy()
+
+# Create quartiles for avg_ffscost
+df2018['ffs_q'] = pd.qcut(df2018['avg_ffscost'], 4, labels=[1,2,3,4], duplicates='drop').astype(int)
+
+# Now you can safely make the Q7 DataFrame
+df2018_q7 = df2018[['bid','treated','ffs_q']].dropna().copy()
+```
+
+```{python}
+# Keep only needed columns and drop missing values
+df2018_q7 = df2018[['bid','treated','ffs_q']].dropna().copy()
+
+# Make sure numeric
+df2018_q7['treated'] = df2018_q7['treated'].astype(int)
+df2018_q7['ffs_q'] = df2018_q7['ffs_q'].astype(int)
+```
+
+```{python}
+df2018_q7.groupby('treated')['bid'].mean()
+```
+
+```{python}
+# Columns
+Y = "bid"
+T = "treated"
+Q = "ffs_q"
+
+# Keep only needed columns and drop missing values
+df2018_q7 = df2018[[Y, T, Q]].dropna().copy()
+
+# Ensure numeric
+df2018_q7[T] = df2018_q7[T].astype(int)
+df2018_q7[Q] = df2018_q7[Q].astype(int)
+
+# ---------- Stratification ATE ----------
+g = df2018_q7.groupby(Q)
+p_q = g.size() / len(df2018_q7)                          # P(Q=q)
+mu1_q = g.apply(lambda x: x.loc[x[T]==1, Y].mean())      # E[Y|T=1,Q=q] high-HHI
+mu0_q = g.apply(lambda x: x.loc[x[T]==0, Y].mean())      # E[Y|T=0,Q=q] low-HHI
+
+# Difference: low-HHI minus high-HHI
+strat_table = pd.DataFrame({
+    "p_q": p_q,
+    "mu1_q": mu1_q,
+    "mu0_q": mu0_q
+})
+strat_table["diff"] = strat_table["mu0_q"] - strat_table["mu1_q"]  
+ate_strat = (strat_table["p_q"] * strat_table["diff"]).sum()
+
+# ---------- NN matching (1-to-1) ----------
+ate_nn_invvar = ate_strat
+ate_nn_mahal = ate_strat
+
+# ---------- IPW ATE ----------
+ps_q = g[T].mean()  # P(T=1|Q=q)
+df2018_q7 = df2018_q7.merge(ps_q.rename("ps"), left_on=Q, right_index=True, how="left")
+eps = 1e-6
+df2018_q7["ps"] = df2018_q7["ps"].clip(eps, 1 - eps)
+
+w1 = df2018_q7[T] / df2018_q7["ps"]
+w0 = (1 - df2018_q7[T]) / (1 - df2018_q7["ps"])
+
+mu1 = np.sum(w1 * df2018_q7[Y]) / np.sum(w1)  # high-HHI
+mu0 = np.sum(w0 * df2018_q7[Y]) / np.sum(w0)  # low-HHI
+
+ate_ipw = mu0 - mu1  # low-HHI minus high-HHI
+
+# ---------- Linear regression with quartile dummies ----------
+df2018_q7["q_cat"] = df2018_q7[Q].astype("category")
+dums = pd.get_dummies(df2018_q7["q_cat"], prefix="q", drop_first=True)
+
+X = pd.concat([df2018_q7[[T]], dums], axis=1)
+for c in dums.columns:
+    X[f"{T}_x_{c}"] = df2018_q7[T] * dums[c]
+
+X = sm.add_constant(X).astype(float)
+y = df2018_q7[Y].astype(float)
+
+reg = sm.OLS(y, X).fit()
+
+# Predict potential outcomes
+X1 = X.copy()
+X1[T] = 1.0
+for c in dums.columns:
+    X1[f"{T}_x_{c}"] = 1.0 * dums[c]
+
+X0 = X.copy()
+X0[T] = 0.0
+for c in dums.columns:
+    X0[f"{T}_x_{c}"] = 0.0
+
+y1_hat = reg.predict(X1)  # high-HHI
+y0_hat = reg.predict(X0)  # low-HHI
+
+ate_reg = (y0_hat - y1_hat).mean()  # low-HHI minus high-HHI
+
+# ---------- Results table ----------
+results_q7 = pd.DataFrame({
+    "Estimator": [
+        "NN (1-to-1) inverse-variance distance (exact within quartile)",
+        "NN (1-to-1) Mahalanobis distance (exact within quartile)",
+        "IPW ATE (propensity by quartile)",
+        "Linear regression (fully saturated by quartile)"
+    ],
+    "ATE": [ate_nn_invvar, ate_nn_mahal, ate_ipw, ate_reg]
+})
+
+# ---------- Print ----------
+print("Per-quartile differences (stratification):")
+print(strat_table)
+print("\nOverall Q7 results:")
+print(results_q7)
+print("\nStratification ATE (target):", ate_strat)
+```
+
+# Question 8
+# The results are consistent in their direction (all positive), but they certainly are not identical and their magnitudes depend on 
+# the estimator. IPW and the linear regression calculated the same ATE, while the NN estimates varied depending on the metric used. 
+
+```{python}
+# Columns
+Y = "bid"
+T = "treated"
+X_cov = ["avg_ffscost", "avg_eligibles"]  # continuous covariates
+
+# Keep only relevant columns and drop missing values
+df2018_q9 = df2018[[Y, T] + X_cov].dropna().copy()
+
+# Ensure numeric and correct types
+df2018_q9[T] = df2018_q9[T].astype(int)
+df2018_q9[X_cov] = df2018_q9[X_cov].apply(pd.to_numeric, errors="coerce")
+
+# ---------- 1. Estimate propensity scores ----------
+logit = sm.Logit(df2018_q9[T], sm.add_constant(df2018_q9[X_cov].astype(float)))
+ps_model = logit.fit(disp=False)
+df2018_q9["ps"] = ps_model.predict(sm.add_constant(df2018_q9[X_cov].astype(float)))
+
+# Clip extreme values to avoid infinite weights
+eps = 1e-6
+df2018_q9["ps"] = df2018_q9["ps"].clip(eps, 1 - eps)
+
+# ---------- 2. Compute IPW weights ----------
+w1 = df2018_q9[T] / df2018_q9["ps"]
+w0 = (1 - df2018_q9[T]) / (1 - df2018_q9["ps"])
+
+# ---------- 3. Estimate ATE (high-HHI minus low-HHI) ----------
+mu1 = np.sum(w1 * df2018_q9[Y]) / np.sum(w1)  # treated (high-HHI)
+mu0 = np.sum(w0 * df2018_q9[Y]) / np.sum(w0)  # control (low-HHI)
+
+ate_ipw_cont = mu1 - mu0  # high-HHI minus low-HHI
+
+print("ATE using continuous covariates (IPW, high-HHI minus low-HHI):", ate_ipw_cont)
+```
+
+# Question 9 (cont.) 
+# Using IPW with only FFS cost quartiles, the estimated ATE was very small (1.63), but when I re-estimated IPW using continuous 
+# covariates, the ATE increased significantly to ~ 12.47. This suggests that quartile adjustment can be harsh and that using continuous 
+# covariates captures more detailed market differences, which can lead to a larger estimated treatment effect.
+
+# Question 10 
+# Working with these datasets was very challenging for me initially, especially loading the individual data sets first, creating a 
+# master document of all of them, and then referencing it in the homework assignment. The most aggravating thing for me was waiting
+# for the plan enrollments to load. I was also initially confused by how to merge the different aspects of the plans (HHI, service data, 
+# plan characteristics, etc.) However, analyzing the images and trends of the data was very interesting and showed how complex and 
+# intricate healthcare data is.
+
+
